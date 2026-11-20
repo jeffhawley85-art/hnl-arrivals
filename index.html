@@ -85,6 +85,14 @@
   .toggle input{width:22px;height:22px}
   ol.steps{padding-left:20px;margin:6px 0;font-size:14px;color:var(--muted)}
   ol.steps b{color:var(--text)}
+  #diagText{width:100%;margin-top:8px;border-radius:10px;border:1px solid var(--line);background:var(--card);color:var(--muted);font:11.5px/1.35 ui-monospace,Menlo,Consolas,monospace;padding:8px}
+  .fnum{display:flex;gap:6px;margin-top:10px}
+  .fnum input{flex:1;min-width:0;height:40px;border-radius:10px;border:1px solid var(--line);background:var(--card2);padding:0 10px;text-transform:uppercase}
+  .fnum input::placeholder{text-transform:none;color:var(--muted)}
+  .fnum .btn{height:40px;padding:0 12px}
+  .note{margin-top:8px;font-size:13px;color:var(--muted);line-height:1.45}
+  .note b{color:var(--text)}
+  .linkbtn{background:none;border:0;padding:0;color:var(--accent);font:inherit;font-size:13px;cursor:pointer;text-decoration:underline}
   .meter{height:8px;border-radius:99px;background:var(--chip);overflow:hidden;margin-top:6px}
   .meter i{display:block;height:100%;background:var(--accent)}
 </style>
@@ -157,12 +165,20 @@
     <label>API units this month (counted on this phone)</label>
     <div class="small" id="usageText"></div>
     <div class="meter"><i id="usageBar" style="width:0"></i></div>
-    <div class="hint">The free Basic plan gives 600 units a month, about 300 refreshes. A tail that isn't found in the HNL list costs an extra 2 to 4 units to look up, at most every 30 minutes.</div>
+    <div class="hint">The free Basic plan gives 600 units a month, about 300 refreshes. A tail that isn't found in the HNL list costs an extra 2 to 4 units to look up. That happens at most every 30 minutes, or every 5 minutes when you tap ↻.</div>
+  </div>
+
+  <div class="field">
+    <label>Troubleshooting</label>
+    <div class="hint" style="margin-top:0">If a plane shows no HNL arrival but FlightAware has one, tap <b>Copy debug info</b> and paste it to Claude. Your API key is not included.</div>
+    <div class="row" style="margin-top:8px"><button class="btn ghost" id="copyDiag" type="button" style="flex:1">Copy debug info</button></div>
+    <textarea id="diagText" readonly rows="7" spellcheck="false"></textarea>
   </div>
 
   <div class="field">
     <label class="toggle"><input type="checkbox" id="demoChk"> Demo mode (sample data, no API key needed)</label>
   </div>
+  <div class="small" style="text-align:center">App version 2</div>
 
   <div class="field">
     <div class="row">
@@ -178,6 +194,7 @@
 
 /* ---------- constants ---------- */
 const STORE_KEY = 'hnlTracker.v1';
+const VERSION = 2;
 const TZ = 'Pacific/Honolulu';
 const HOST = 'aerodatabox.p.rapidapi.com';
 const BASE = 'https://' + HOST;
@@ -191,15 +208,21 @@ const GONE = new Set(['Departed', 'EnRoute', 'Approaching', 'Arrived', 'Diverted
 
 /* ---------- state ---------- */
 function defaults() {
-  return { tails: [], apiKey: '', autoMins: 0, demo: false,
-           cache: { fids: null, reg: {} }, track: {}, usage: { month: '', units: 0 },
+  return { version: VERSION, tails: [], apiKey: '', autoMins: 0, demo: false, flightFor: {},
+           cache: { fids: null, reg: {}, num: {} }, track: {}, usage: { month: '', units: 0 },
+           diag: { calls: [], fids: null, tails: {} },
            lastUpdated: 0, error: null, quota: null };
 }
 let S = defaults();
 try {
   const saved = JSON.parse(localStorage.getItem(STORE_KEY) || 'null');
   if (saved && typeof saved === 'object') S = Object.assign(defaults(), saved);
-  S.cache = Object.assign({ fids: null, reg: {} }, S.cache || {});
+  S.cache = Object.assign({ fids: null, reg: {}, num: {} }, S.cache || {});
+  S.diag = Object.assign({ calls: [], fids: null, tails: {} }, S.diag || {});
+  S.flightFor = S.flightFor || {};
+  if (S.version !== VERSION) {            // new app version: drop old cached lookups so tails are re-checked
+    S.cache = { fids: null, reg: {}, num: {} }; S.version = VERSION;
+  }
 } catch (e) { /* storage unavailable: run in memory */ }
 function save() { try { localStorage.setItem(STORE_KEY, JSON.stringify(S)); } catch (e) {} }
 
@@ -215,6 +238,15 @@ function normTail(s) {
   if (/^\d{3}$/.test(s)) s = 'N' + s + 'HA';          // "205"   -> N205HA
   else if (/^\d{3}HA$/.test(s)) s = 'N' + s;           // "205HA" -> N205HA
   return s;
+}
+function normFlight(s) {
+  s = String(s || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+  const m = s.match(/^([A-Z]{3}|[A-Z0-9]{2})(\d{1,4})[A-Z]?$/);
+  if (!m) return '';
+  let code = m[1];
+  const icao = { HAL: 'HA', ASA: 'AS', UAL: 'UA', DAL: 'DL', AAL: 'AA', SWA: 'WN' };
+  if (icao[code]) code = icao[code];
+  return code + String(parseInt(m[2], 10));
 }
 function parseTime(dt) {
   if (!dt) return null;
@@ -334,25 +366,55 @@ function analyse(tail, legs, now) {
   return { mode: 'none', lastOut, model: (mine[0] && mine[0].model) || '' };
 }
 
+function numberLegsFor(tail) {
+  // Legs found by the inbound flight number the user typed for this tail.
+  const want = S.flightFor[tail];
+  if (!want) return [];
+  const pool = [];
+  if (S.cache.fids) pool.push(...S.cache.fids.legs);
+  const nc = S.cache.num[tail];
+  if (nc && nc.num === want) pool.push(...nc.legs);
+  const out = [];
+  for (const l of pool) {
+    if (normFlight(l.number) !== want || l.to.iata !== 'HNL') continue;
+    if (l.reg && l.reg !== tail) continue;          // the data says another plane is on it
+    out.push(Object.assign({}, l, { reg: tail, codeshare: false, byNumber: true }));
+  }
+  return out;
+}
+function numberConflict(tail) {
+  const want = S.flightFor[tail];
+  if (!want) return '';
+  const pool = (S.cache.fids ? S.cache.fids.legs : []).concat((S.cache.num[tail] || {}).legs || []);
+  const hit = pool.find(l => normFlight(l.number) === want && l.to.iata === 'HNL' && l.reg && l.reg !== tail);
+  return hit ? hit.reg : '';
+}
 function allLegsFor(tail) {
-  const legs = [];
-  const prefer = new Set();
   if (S.demo) return (demoLegs || []).slice();
-  if (S.cache.fids) for (const l of S.cache.fids.legs) if (l.reg === tail) { legs.push(l); prefer.add(legKey(l)); }
+  const legs = [], seen = new Set();
+  const add = (l) => { const k = legKey(l); if (!seen.has(k)) { seen.add(k); legs.push(l); } };
+  if (S.cache.fids) for (const l of S.cache.fids.legs) if (l.reg === tail) add(l);
   const r = S.cache.reg[tail];
-  if (r) for (const l of r.legs) if (!prefer.has(legKey(l))) legs.push(l);
+  if (r) for (const l of r.legs) add(l);
+  for (const l of numberLegsFor(tail)) add(l);
   return legs;
 }
 
 /* ---------- network ---------- */
 class ApiError extends Error { constructor(msg, code) { super(msg); this.code = code; } }
-async function api(path) {
+function logCall(what, status) {
+  S.diag.calls.unshift({ at: Date.now(), what, status });
+  S.diag.calls = S.diag.calls.slice(0, 15);
+}
+async function api(path, what) {
   let res;
   try {
     res = await fetch(BASE + path, { headers: { 'X-RapidAPI-Key': S.apiKey, 'X-RapidAPI-Host': HOST } });
   } catch (e) {
+    logCall(what, 'network error');
     throw new ApiError("Couldn't reach the flight data service. Check your signal and try again.", 'net');
   }
+  logCall(what, res.status);
   if (res.ok || res.status === 204) addUnits(2);
   for (const h of ['x-ratelimit-requests-remaining', 'x-ratelimit-units-remaining', 'x-ratelimit-api-units-remaining']) {
     const v = res.headers.get(h); if (v != null) S.quota = { name: h, value: v, at: Date.now() };
@@ -364,7 +426,22 @@ async function api(path) {
     throw new ApiError('API limit reached (too fast, or this month\'s units are used up). Try again in a minute, or check your plan on RapidAPI.', 'limit');
   if (!res.ok) throw new ApiError('Flight data service error (' + res.status + '). Try again shortly.', 'http');
   const txt = await res.text();
-  return txt ? JSON.parse(txt) : null;
+  if (!txt) return null;
+  try { return JSON.parse(txt); }
+  catch (e) { throw new ApiError('Unexpected reply from the flight data service.', 'parse'); }
+}
+
+function fidsSummary(d) {
+  const arr = (d && d.arrivals) || [], dep = (d && d.departures) || [];
+  const reg = (f) => f.aircraft && f.aircraft.reg;
+  const isHA = (f) => /^(HA|AS)\s?\d/i.test(f.number || '');
+  return {
+    at: tm(Date.now()), arrivals: arr.length, departures: dep.length,
+    arrivalsWithTail: arr.filter(reg).length, departuresWithTail: dep.filter(reg).length,
+    haAsArrivals: arr.filter(isHA).length, haAsArrivalsWithTail: arr.filter(f => isHA(f) && reg(f)).length,
+    haAsTailsSeen: [...new Set(arr.concat(dep).filter(isHA).map(reg).filter(Boolean))].slice(0, 25),
+    sample: arr.filter(isHA).slice(0, 3).map(f => ({ number: f.number, status: f.status, tail: reg(f) || null, fields: Object.keys(f).join(',') }))
+  };
 }
 
 async function refresh(opts) {
@@ -375,34 +452,63 @@ async function refresh(opts) {
   if (!S.apiKey) { render(); return; }
   busy = true; setSpin(true);
   let calls = 0;
+  const pause = async () => { if (calls) await sleep(1100); };   // free plan: 1 request per second
   try {
     const now = Date.now();
     if (opts.force || !S.cache.fids || now - S.cache.fids.at > FIDS_TTL) {
       const q = '/flights/airports/iata/HNL?offsetMinutes=-120&durationMinutes=720&direction=Both&withLeg=true' +
                 '&withCancelled=true&withCodeshared=false&withCargo=false&withPrivate=false&withLocation=true';
-      const d = await api(q); calls++;
+      const d = await api(q, 'HNL list'); calls++;
       S.cache.fids = { at: Date.now(), legs: legsFromFids(d) };
+      S.diag.fids = fidsSummary(d);
       save();
     }
-    // Tails not found in the 12-hour HNL list: look them up by registration (today, then tomorrow).
+    const needs = (x) => x.mode === 'none' || (x.mode === 'ground' && !x.next);
+    const ttl = opts.force ? 5 * MIN : REG_TTL;
     for (const tail of S.tails) {
-      const a = analyse(tail, allLegsFor(tail), now);
-      if (a.mode !== 'none' && !(a.mode === 'ground' && !a.next)) continue;
-      const rc = S.cache.reg[tail];
-      if (rc && now - rc.at < REG_TTL) continue;
-      let legs = [];
-      for (const add of [0, 1]) {
-        if (calls) await sleep(1100);
-        const d = await api('/flights/reg/' + encodeURIComponent(tail) + '/' + hstYMD(now + add * 86400e3) +
-                            '?dateLocalRole=Both&withAircraftImage=false&withLocation=true');
-        calls++;
-        legs = legs.concat(legsFromFlights(d));
-        const tmpFids = S.cache.fids ? S.cache.fids.legs.filter(l => l.reg === tail) : [];
-        const b = analyse(tail, tmpFids.concat(legs), now);
-        if (b.mode === 'inbound' || (b.mode === 'ground' && b.next)) break;
+      const td = S.diag.tails[tail] = S.diag.tails[tail] || {};
+      td.inHnlList = S.cache.fids ? S.cache.fids.legs.filter(l => l.reg === tail).length : 0;
+      let a = analyse(tail, allLegsFor(tail), now);
+      // Fallback 1: look the tail up directly (today, then tomorrow).
+      if (needs(a)) {
+        const rc = S.cache.reg[tail];
+        if (!rc || now - rc.at >= ttl) {
+          let legs = []; const counts = [];
+          for (const addDay of [0, 1]) {
+            await pause();
+            const day = hstYMD(now + addDay * 86400e3);
+            const d = await api('/flights/reg/' + encodeURIComponent(tail) + '/' + day +
+                                '?dateLocalRole=Both&withAircraftImage=false&withLocation=true', tail + ' ' + day);
+            calls++;
+            const got = legsFromFlights(d);
+            counts.push(day + ': ' + got.length);
+            legs = legs.concat(got);
+            if (!needs(analyse(tail, allLegsFor(tail).concat(legs), now))) break;
+          }
+          S.cache.reg[tail] = { at: Date.now(), legs };
+          td.tailLookup = counts.join(', ') + ' flights';
+          td.tailFlights = legs.slice(0, 6).map(l => l.number + ' ' + (l.from.iata || '?') + '-' + (l.to.iata || '?') + ' ' + l.status);
+          save();
+        }
+        a = analyse(tail, allLegsFor(tail), now);
       }
-      S.cache.reg[tail] = { at: Date.now(), legs };
-      save();
+      // Fallback 2: the inbound flight number the user typed for this tail.
+      const want = S.flightFor[tail];
+      if (want && a.mode === 'none') {
+        const nc = S.cache.num[tail];
+        if (!nc || nc.num !== want || now - nc.at >= ttl) {
+          await pause();
+          const day = hstYMD(now);
+          const d = await api('/flights/number/' + encodeURIComponent(want) + '/' + day +
+                              '?dateLocalRole=Both&withAircraftImage=false&withLocation=true', want + ' ' + day);
+          calls++;
+          const got = legsFromFlights(d);
+          S.cache.num[tail] = { at: Date.now(), num: want, legs: got };
+          td.flightLookup = want + ': ' + got.length + ' flights';
+          save();
+        }
+      }
+      td.showing = analyse(tail, allLegsFor(tail), now).mode;
     }
     S.lastUpdated = Date.now(); S.error = null;
   } catch (e) {
@@ -410,6 +516,16 @@ async function refresh(opts) {
   } finally {
     busy = false; setSpin(false); save(); render();
   }
+}
+
+function diagText() {
+  return JSON.stringify({
+    app: 'HNL Arrivals v' + VERSION, at: tm(Date.now()) + ' HST', tails: S.tails, flightNumbers: S.flightFor,
+    keySaved: !!S.apiKey, keyLength: (S.apiKey || '').length, unitsThisMonth: S.usage.units,
+    lastUpdated: S.lastUpdated ? tm(S.lastUpdated) : null, lastError: S.error ? S.error.msg : null,
+    hnlList: S.diag.fids, perTail: S.diag.tails,
+    calls: S.diag.calls.map(c => tm(c.at) + '  ' + c.what + '  -> ' + c.status)
+  }, null, 1);
 }
 
 /* ---------- rendering ---------- */
@@ -461,16 +577,40 @@ function cardHTML(tail, a, now) {
           '<button class="x" data-rm="' + esc(tail) + '" aria-label="Remove ' + esc(tail) + '">×</button></div>';
 
   if (a.mode === 'none') {
-    h += '<div class="route">No arrival into HNL found for today or tomorrow yet.</div>';
-    if (a.lastOut) h += '<div class="small" style="margin-top:6px">Last seen leaving HNL: <b>' + esc(a.lastOut.number) + ' → ' +
+    const live = S.apiKey && !S.demo;
+    const r = S.cache.reg[tail];
+    const known = r ? r.legs.filter(l => !l.codeshare) : [];
+    const want = S.flightFor[tail];
+    if (!live && !S.demo) {
+      h += '<div class="route">Add your API key in Settings to load live data.</div>';
+    } else if (known.length) {
+      h += '<div class="route">No arrival into HNL found for today or tomorrow.</div>' +
+           '<div class="note">AeroDataBox has these flights for ' + esc(tail) + ':<br>' +
+           known.slice(0, 4).map(l => '<b>' + esc(l.number || '?') + '</b> ' + esc(l.from.iata || '?') + ' → ' + esc(l.to.iata || '?') +
+             ' · ' + tm(l.from.est ?? l.from.sched)).join('<br>') + '</div>';
+    } else {
+      h += '<div class="route">AeroDataBox hasn\'t linked any flights to ' + esc(tail) + ' for today or tomorrow yet.</div>' +
+           '<div class="note">It often doesn\'t know which plane is on a flight until it starts tracking that flight. ' +
+           'FlightAware gets the airline\'s tail assignments sooner. If you know the inbound flight number, enter it below to get the ETA and gate now.</div>';
+    }
+    if (a.lastOut) h += '<div class="note">Last seen leaving HNL: <b>' + esc(a.lastOut.number) + ' → ' +
       esc(a.lastOut.to.iata) + '</b> at ' + tm(a.lastOut.from.est) + '</div>';
-    if (!S.apiKey && !S.demo) h += '<div class="small" style="margin-top:6px">Add your API key in Settings to load live data.</div>';
+    if (live) {
+      const other = numberConflict(tail);
+      if (want) h += '<div class="note">Watching flight <b>' + esc(want) + '</b>: ' +
+        (other ? 'AeroDataBox shows it on <b>' + esc(other) + '</b>, not ' + esc(tail) + '.' : 'not found in today\'s HNL arrivals yet.') +
+        ' <button class="linkbtn" data-unflight="' + esc(tail) + '">Remove</button></div>';
+      h += '<form class="fnum" data-tail="' + esc(tail) + '"><input placeholder="Inbound flight #, e.g. HA 7" aria-label="Inbound flight number for ' +
+           esc(tail) + '" autocomplete="off"><button class="btn" type="submit">Track</button></form>';
+    }
     return h + links(tail) + '</div>';
   }
 
   const l = a.a, to = l.to, from = l.from;
   h += '<div class="route"><b>' + esc(l.number || 'Flight ?') + '</b> from <b>' + esc(from.iata || from.name || '?') + '</b>' +
        (from.name && from.iata ? ' · ' + esc(from.name) : '') + '</div>';
+  if (l.byNumber) h += '<div class="note">Found by the flight number you entered, because the data hasn\'t linked this tail yet. ' +
+       'The next departure may not show until it does. <button class="linkbtn" data-unflight="' + esc(tail) + '">Stop using flight #</button></div>';
 
   if (a.mode === 'ground') {
     const at = to.revised ?? to.runway ?? to.est;
@@ -592,13 +732,37 @@ $('addForm').addEventListener('submit', (e) => {
 });
 document.addEventListener('click', (e) => {
   const rm = e.target.closest('[data-rm]');
-  if (rm) { const t = rm.getAttribute('data-rm'); S.tails = S.tails.filter(x => x !== t); delete S.track[t]; delete S.cache.reg[t]; save(); render(); return; }
+  if (rm) {
+    const t = rm.getAttribute('data-rm'); S.tails = S.tails.filter(x => x !== t);
+    delete S.track[t]; delete S.cache.reg[t]; delete S.cache.num[t]; delete S.flightFor[t]; delete S.diag.tails[t];
+    save(); render(); return;
+  }
+  const uf = e.target.closest('[data-unflight]');
+  if (uf) { const t = uf.getAttribute('data-unflight'); delete S.flightFor[t]; delete S.cache.num[t]; delete S.track[t]; save(); render(); return; }
   if (e.target.closest('[data-open="settings"]')) openSheet();
   if (e.target.closest('[data-demo]')) {
     S.demo = true;
     if (!S.tails.length) S.tails = ['N205HA', 'N223HA', 'N388HA'];
     save(); refresh({ force: true });
   }
+});
+document.addEventListener('submit', (e) => {
+  const f = e.target.closest('form.fnum');
+  if (!f) return;
+  e.preventDefault();
+  const tail = f.getAttribute('data-tail'), input = f.querySelector('input');
+  const n = normFlight(input.value);
+  if (!n) { input.value = ''; input.placeholder = 'Type it like HA 7 or AS 853'; return; }
+  S.flightFor[tail] = n; delete S.cache.num[tail];
+  save(); render(); refresh();
+});
+$('copyDiag').addEventListener('click', () => {
+  const t = diagText(), box = $('diagText'), btn = $('copyDiag');
+  box.value = t;
+  const manual = () => { box.focus(); box.select(); btn.textContent = 'Select the text below and copy it'; };
+  try {
+    navigator.clipboard.writeText(t).then(() => { btn.textContent = 'Copied ✓ Now paste it to Claude'; }, manual);
+  } catch (err) { manual(); }
 });
 $('refreshBtn').addEventListener('click', () => refresh({ force: true }));
 $('settingsBtn').addEventListener('click', openSheet);
@@ -609,6 +773,7 @@ function openSheet() {
   $('autoSel').value = String(S.autoMins || 0);
   $('demoChk').checked = !!S.demo;
   $('clearBtn').textContent = 'Clear all tails'; $('clearBtn').dataset.armed = '';
+  $('diagText').value = diagText(); $('copyDiag').textContent = 'Copy debug info';
   $('sheet').classList.add('open'); $('sheetbg').classList.add('open');
 }
 function closeSheet() { $('sheet').classList.remove('open'); $('sheetbg').classList.remove('open'); }
@@ -629,7 +794,8 @@ $('demoChk').addEventListener('change', () => {
 $('clearBtn').addEventListener('click', () => {
   const btn = $('clearBtn');
   if (!btn.dataset.armed) { btn.dataset.armed = '1'; btn.textContent = 'Tap again to clear'; return; }
-  S.tails = []; S.track = {}; S.cache.reg = {}; save(); closeSheet(); render();
+  S.tails = []; S.track = {}; S.cache.reg = {}; S.cache.num = {}; S.flightFor = {}; S.diag.tails = {};
+  save(); closeSheet(); render();
 });
 
 function setupAuto() {
