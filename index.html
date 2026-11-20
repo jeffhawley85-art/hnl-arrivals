@@ -178,7 +178,7 @@
   <div class="field">
     <label class="toggle"><input type="checkbox" id="demoChk"> Demo mode (sample data, no API key needed)</label>
   </div>
-  <div class="small" style="text-align:center">App version 2</div>
+  <div class="small" style="text-align:center">App version 3</div>
 
   <div class="field">
     <div class="row">
@@ -194,7 +194,7 @@
 
 /* ---------- constants ---------- */
 const STORE_KEY = 'hnlTracker.v1';
-const VERSION = 2;
+const VERSION = 3;
 const TZ = 'Pacific/Honolulu';
 const HOST = 'aerodatabox.p.rapidapi.com';
 const BASE = 'https://' + HOST;
@@ -220,7 +220,7 @@ try {
   S.cache = Object.assign({ fids: null, reg: {}, num: {} }, S.cache || {});
   S.diag = Object.assign({ calls: [], fids: null, tails: {} }, S.diag || {});
   S.flightFor = S.flightFor || {};
-  if (S.version !== VERSION) {            // new app version: drop old cached lookups so tails are re-checked
+  if (saved && saved.version !== VERSION) {   // new app version: drop old cached lookups so tails are re-checked
     S.cache = { fids: null, reg: {}, num: {} }; S.version = VERSION;
   }
 } catch (e) { /* storage unavailable: run in memory */ }
@@ -299,6 +299,7 @@ function mv(m) {
     iata: (a.iata || '').toUpperCase(), name: a.shortName || a.municipalityName || a.name || '',
     sched, revised, predicted, runway,
     est: revised ?? predicted ?? sched,
+    src: revised != null ? 'live' : predicted != null ? 'predicted' : 'scheduled',
     gate: m.gate || '', terminal: m.terminal || ''
   };
 }
@@ -310,6 +311,13 @@ function normLeg(f, side) {
   else { from = mv(f.movement); to = mv(null); }
   if (side === 'arrivals' && !to.iata) to.iata = 'HNL';
   if (side === 'departures' && !from.iata) from.iata = 'HNL';
+  // No live arrival estimate, but the flight left (or is leaving) late: push the ETA back by that delay.
+  const depAt = from.revised ?? from.runway;
+  if (to.revised == null && to.sched != null && from.sched != null && depAt != null) {
+    const delay = depAt - from.sched;
+    const guess = to.sched + delay;
+    if (delay >= 5 * MIN && (to.est == null || guess > to.est)) { to.est = guess; to.src = 'depdelay'; to.depDelay = delay; }
+  }
   const loc = f.location || null;
   return {
     number: f.number || '', status: f.status || 'Unknown',
@@ -487,7 +495,7 @@ async function refresh(opts) {
           }
           S.cache.reg[tail] = { at: Date.now(), legs };
           td.tailLookup = counts.join(', ') + ' flights';
-          td.tailFlights = legs.slice(0, 6).map(l => l.number + ' ' + (l.from.iata || '?') + '-' + (l.to.iata || '?') + ' ' + l.status);
+          td.tailFlights = legs.slice(0, 6).map(legDiag);
           save();
         }
         a = analyse(tail, allLegsFor(tail), now);
@@ -508,7 +516,8 @@ async function refresh(opts) {
           save();
         }
       }
-      td.showing = analyse(tail, allLegsFor(tail), now).mode;
+      const shown = analyse(tail, allLegsFor(tail), now);
+      td.showing = shown.mode + (shown.a ? ': ' + legDiag(shown.a) : '');
     }
     S.lastUpdated = Date.now(); S.error = null;
   } catch (e) {
@@ -518,6 +527,13 @@ async function refresh(opts) {
   }
 }
 
+function legDiag(l) {
+  const t = (x) => x == null ? '-' : tm(x);
+  return l.number + ' ' + (l.from.iata || '?') + '-' + (l.to.iata || '?') + ' ' + l.status +
+    ' | dep sch ' + t(l.from.sched) + ' rev ' + t(l.from.revised) + ' rwy ' + t(l.from.runway) +
+    ' | arr sch ' + t(l.to.sched) + ' rev ' + t(l.to.revised) + ' pred ' + t(l.to.predicted) + ' rwy ' + t(l.to.runway) +
+    ' | using ' + (l.to.src || '?') + ' ' + t(l.to.est) + (l.to.gate ? ' gate ' + l.to.gate : '');
+}
 function diagText() {
   return JSON.stringify({
     app: 'HNL Arrivals v' + VERSION, at: tm(Date.now()) + ' HST', tails: S.tails, flightNumbers: S.flightFor,
@@ -625,7 +641,8 @@ function cardHTML(tail, a, now) {
 
   // inbound
   const notDeparted = ['Expected', 'CheckIn', 'Boarding', 'GateClosed', 'Unknown', 'Delayed'].includes(l.status) && !l.loc;
-  h += '<div class="chips">' + statusChip(l) + (l.status === 'Canceled' ? '' : delayChip(to.sched, to.est)) + '</div>';
+  h += '<div class="chips">' + statusChip(l) + (l.status === 'Canceled' ? '' :
+       to.src === 'scheduled' ? '<span class="chip">No live ETA</span>' : delayChip(to.sched, to.est)) + '</div>';
   const until = to.est != null ? to.est - now : null;
   let sub;
   if (until == null) sub = '';
@@ -635,6 +652,9 @@ function cardHTML(tail, a, now) {
   h += '<div class="grid"><div><div class="lbl">Arrives HNL</div><div class="big">' + bigTm(to.est) + '</div>' +
        '<div class="small">' + sub + (to.sched != null && to.est !== to.sched ? ' · sched ' + tm(to.sched) : '') + '</div></div>' +
        gateBlock(to, 'Gate') + '</div>';
+  if (to.src === 'scheduled') h += '<div class="note">This is the <b>scheduled</b> time. AeroDataBox has no live estimate for this flight yet, so check FlightAware if it matters.</div>';
+  else if (to.src === 'depdelay') h += '<div class="note">Estimated: it left about <b>' + Math.round(to.depDelay / MIN) + ' min late</b> and there\'s no live ETA yet, so treat this as approximate.</div>';
+  else if (to.src === 'predicted') h += '<div class="note">AeroDataBox prediction (no live ETA yet).</div>';
 
   // ETA movement since first seen
   const tr = S.track[tail];
