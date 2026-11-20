@@ -178,7 +178,7 @@
   <div class="field">
     <label class="toggle"><input type="checkbox" id="demoChk"> Demo mode (sample data, no API key needed)</label>
   </div>
-  <div class="small" style="text-align:center">App version 4</div>
+  <div class="small" style="text-align:center">App version 5</div>
 
   <div class="field">
     <div class="row">
@@ -194,13 +194,61 @@
 
 /* ---------- constants ---------- */
 const STORE_KEY = 'hnlTracker.v1';
-const VERSION = 4;
-// Free community ADS-B networks (no key). Tried in order; the one that works is remembered.
-const ADSB = [
-  { name: 'adsb.lol',       url: (la, lo, r) => 'https://api.adsb.lol/v2/point/' + la + '/' + lo + '/' + r },
-  { name: 'airplanes.live', url: (la, lo, r) => 'https://api.airplanes.live/v2/point/' + la + '/' + lo + '/' + r },
-  { name: 'adsb.fi',        url: (la, lo, r) => 'https://opendata.adsb.fi/api/v2/lat/' + la + '/lon/' + lo + '/dist/' + r }
+const VERSION = 5;
+// Free live-position sources (no keys). Tried in order until one works; the best one is remembered.
+const ADSBX = (name, url) => ({ name, url, parse: parseAdsbx });
+const viaProxy = (proxy, wrap, base) => ({ name: base.name + ' via ' + proxy, url: (la, lo, r) => wrap(base.url(la, lo, r)), parse: base.parse });
+const LOL = ADSBX('adsb.lol', (la, lo, r) => 'https://api.adsb.lol/v2/point/' + la + '/' + lo + '/' + r);
+const ALIVE = ADSBX('airplanes.live', (la, lo, r) => 'https://api.airplanes.live/v2/point/' + la + '/' + lo + '/' + r);
+const ADSBFI = ADSBX('adsb.fi', (la, lo, r) => 'https://opendata.adsb.fi/api/v2/lat/' + la + '/lon/' + lo + '/dist/' + r);
+const OPENSKY = { name: 'OpenSky', slow: true,       // anonymous: 400 credits/day, this box costs 1 per call
+  url: () => 'https://opensky-network.org/api/states/all?lamin=18.7&lamax=22.6&lomin=-160.5&lomax=-154.6', parse: parseOpenSky };
+const SOURCES = [
+  LOL, ALIVE, ADSBFI,
+  viaProxy('allorigins', (u) => 'https://api.allorigins.win/raw?url=' + encodeURIComponent(u), LOL),
+  viaProxy('codetabs', (u) => 'https://api.codetabs.com/v1/proxy?quest=' + u, LOL),
+  viaProxy('cors.lol', (u) => 'https://api.cors.lol/?url=' + encodeURIComponent(u), ALIVE),
+  OPENSKY
 ];
+function parseAdsbx(d) {
+  const list = (d && (d.ac || d.aircraft)) || [];
+  return list.filter(x => typeof x.lat === 'number' && typeof x.lon === 'number').map(x => ({
+    hex: String(x.hex || '').replace('~', '').toLowerCase(), reg: normTail(x.r || x.reg || ''),
+    cs: String(x.flight || '').trim(), lat: x.lat, lon: x.lon,
+    alt: x.alt_baro === 'ground' ? 'ground' : (typeof x.alt_baro === 'number' ? x.alt_baro : (typeof x.alt_geom === 'number' ? x.alt_geom : null)),
+    gs: typeof x.gs === 'number' ? x.gs : null,
+    track: typeof x.track === 'number' ? x.track : (typeof x.true_heading === 'number' ? x.true_heading : null),
+    seenPos: typeof x.seen_pos === 'number' ? x.seen_pos : (typeof x.seen === 'number' ? x.seen : 0) }));
+}
+function parseOpenSky(d) {
+  const nowS = Date.now() / 1000;
+  return ((d && d.states) || []).filter(v => typeof v[5] === 'number' && typeof v[6] === 'number').map(v => ({
+    hex: String(v[0] || '').toLowerCase(), reg: '', cs: String(v[1] || '').trim(), lat: v[6], lon: v[5],
+    alt: v[8] ? 'ground' : (typeof v[7] === 'number' ? Math.round(v[7] * 3.28084) : (typeof v[13] === 'number' ? Math.round(v[13] * 3.28084) : null)),
+    gs: typeof v[9] === 'number' ? Math.round(v[9] * 1.94384) : null, track: typeof v[10] === 'number' ? v[10] : null,
+    seenPos: typeof v[3] === 'number' ? Math.max(0, nowS - v[3]) : 0 }));
+}
+// US tail number -> transponder (Mode S) code, so planes can be matched even when a source has no tail numbers.
+const NL = 'ABCDEFGHJKLMNPQRSTUVWXYZ';
+const N_SUF = 1 + 24 * 25, N_B4 = 1 + 24 + 10, N_B3 = 10 * N_B4 + N_SUF, N_B2 = 10 * N_B3 + N_SUF, N_B1 = 10 * N_B2 + N_SUF;
+function tailHex(tail) {
+  const t = normTail(tail);
+  if (!/^N[1-9][0-9A-HJ-NP-Z]{0,4}$/.test(t)) return '';
+  const n = t.slice(1), isL = (c) => NL.includes(c);
+  const hex = (v) => v.toString(16).padStart(6, '0');
+  const suf = (x) => { let c = 25 * NL.indexOf(x[0]) + 1; if (x.length === 2) c += NL.indexOf(x[1]) + 1; return c; };
+  let v = 0xA00001 + (parseInt(n[0], 10) - 1) * N_B1;
+  const bucket = [0, N_B2, N_B3, N_B4];
+  for (let i = 1; i <= 3; i++) {
+    const c = n[i];
+    if (c === undefined) return hex(v);
+    if (isL(c)) { const x = n.slice(i); if (x.length > 2 || ![...x].every(isL)) return ''; return hex(v + suf(x)); }
+    v += N_SUF + parseInt(c, 10) * bucket[i];
+  }
+  if (n.length === 4) return hex(v);
+  const c = n[4];
+  return hex(isL(c) ? v + 1 + NL.indexOf(c) : v + 1 + 24 + parseInt(c, 10));
+}
 const HI_AIRPORTS = [
   { iata: 'HNL', lat: 21.3187, lon: -157.9224 }, { iata: 'OGG', lat: 20.8986, lon: -156.4305 },
   { iata: 'KOA', lat: 19.7388, lon: -156.0456 }, { iata: 'LIH', lat: 21.9760, lon: -159.3390 },
@@ -519,49 +567,48 @@ function liveLegs(tail, base) {
 }
 async function fetchLive() {
   if (S.demo || !S.tails.length) return false;
-  const order = ADSB.slice().sort((x, y) => (y.name === S.liveProvider) - (x.name === S.liveProvider));
+  const order = SOURCES.slice().sort((x, y) => (y.name === S.liveProvider) - (x.name === S.liveProvider));
+  const want = S.tails.map(t => ({ tail: t, hex: tailHex(t) }));
   const failed = [];
-  for (const p of order) {
+  let best = null, wins = 0;
+  for (const src of order) {
     const ctl = new AbortController(), timer = setTimeout(() => ctl.abort(), 8000);
     try {
-      const res = await fetch(p.url(HNL.lat, HNL.lon, 250), { signal: ctl.signal });
+      const res = await fetch(src.url(HNL.lat, HNL.lon, 250), { signal: ctl.signal });
       clearTimeout(timer);
-      if (!res.ok) { failed.push(p.name + ' ' + res.status); continue; }
-      const d = await res.json();
-      const list = (d && (d.ac || d.aircraft)) || [];
-      const now = Date.now(), want = new Set(S.tails), mine = {};
+      if (!res.ok) { failed.push(src.name + ' ' + res.status); continue; }
+      const list = src.parse(await res.json());
+      const now = Date.now(), mine = {};
       for (const x of list) {
-        const reg = normTail(x.r || x.reg || '');
-        if (!want.has(reg) || typeof x.lat !== 'number' || typeof x.lon !== 'number') continue;
-        mine[reg] = {
-          cs: String(x.flight || '').trim(), lat: x.lat, lon: x.lon,
-          alt: x.alt_baro === 'ground' ? 'ground' : (typeof x.alt_baro === 'number' ? x.alt_baro : (typeof x.alt_geom === 'number' ? x.alt_geom : null)),
-          gs: typeof x.gs === 'number' ? x.gs : null,
-          track: typeof x.track === 'number' ? x.track : (typeof x.true_heading === 'number' ? x.true_heading : null),
-          seenPos: typeof x.seen_pos === 'number' ? x.seen_pos : (typeof x.seen === 'number' ? x.seen : 0), at: now
-        };
+        const w = want.find(w => (x.reg && x.reg === w.tail) || (w.hex && x.hex === w.hex));
+        if (w) mine[w.tail] = Object.assign({}, x, { at: now });
       }
-      S.live = { at: now, provider: p.name, ac: mine, count: list.length };
-      S.liveProvider = p.name;
-      for (const [tail, a] of Object.entries(mine)) {
-        S.lastLive[tail] = a;
-        const ap = nearestAirport(a.lat, a.lon);
-        if (isGround(a) && ap.iata === 'HNL' && ap.d <= 4) { if (!S.groundSeen[tail]) S.groundSeen[tail] = { at: now - (a.seenPos || 0) * 1000 }; }
-        else delete S.groundSeen[tail];
-      }
-      S.diag.live = { provider: p.name, at: tm(now), aircraftWithin250nm: list.length, failedFirst: failed,
-        yourTails: Object.fromEntries(Object.entries(mine).map(([k, v]) => [k, (v.cs || 'no callsign') + ' · ' +
-          (isGround(v) ? 'ground' : v.alt + ' ft ' + v.gs + ' kt') + ' · ' + Math.round(nm(v.lat, v.lon, HNL.lat, HNL.lon)) + ' nm']) ) };
-      save();
-      return true;
+      const score = Object.keys(mine).length * 1000 + Math.min(list.length, 999);
+      if (!best || score > best.score) best = { src, list, mine, now, score };
+      wins++;
+      // Good enough: found every tail, or found some, or two working sources already compared.
+      if (Object.keys(mine).length === want.length || Object.keys(mine).length > 0 || wins >= 2) break;
     } catch (e) {
       clearTimeout(timer);
-      failed.push(p.name + ' ' + (e && e.name === 'AbortError' ? 'timeout' : 'blocked'));
+      failed.push(src.name + ' ' + (e && e.name === 'AbortError' ? 'timeout' : 'blocked'));
     }
   }
-  S.diag.live = { at: tm(Date.now()), failed };
+  if (!best) { S.diag.live = { at: tm(Date.now()), failed }; save(); return false; }
+  const { src, list, mine, now } = best;
+  S.live = { at: now, provider: src.name, slow: !!src.slow, ac: mine, count: list.length };
+  S.liveProvider = src.name;
+  for (const [tail, a] of Object.entries(mine)) {
+    S.lastLive[tail] = a;
+    const ap = nearestAirport(a.lat, a.lon);
+    if (isGround(a) && ap.iata === 'HNL' && ap.d <= 4) { if (!S.groundSeen[tail]) S.groundSeen[tail] = { at: now - (a.seenPos || 0) * 1000 }; }
+    else delete S.groundSeen[tail];
+  }
+  S.diag.live = { provider: src.name, at: tm(now), aircraftInArea: list.length, failedFirst: failed,
+    tailCodes: Object.fromEntries(want.map(w => [w.tail, w.hex || 'n/a'])),
+    yourTails: Object.fromEntries(Object.entries(mine).map(([k, v]) => [k, (v.cs || 'no callsign') + ' · ' +
+      (isGround(v) ? 'ground' : v.alt + ' ft ' + v.gs + ' kt') + ' · ' + Math.round(nm(v.lat, v.lon, HNL.lat, HNL.lon)) + ' nm'])) };
   save();
-  return false;
+  return true;
 }
 
 /* ---------- network ---------- */
@@ -1008,6 +1055,7 @@ setInterval(() => { if (document.visibilityState === 'visible' && !busy) render(
 let liveBusy = false;
 setInterval(async () => {                 // free live positions every minute while the app is open
   if (document.visibilityState !== 'visible' || busy || liveBusy || S.demo || !S.tails.length) return;
+  if (S.live && S.live.slow && Date.now() - S.live.at < 115e3) return;   // OpenSky: every 2 minutes
   liveBusy = true;
   try { await fetchLive(); } catch (e) {} finally { liveBusy = false; render(); }
 }, 60e3);
