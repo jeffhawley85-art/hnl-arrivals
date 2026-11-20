@@ -121,7 +121,7 @@
   <div id="cards"></div>
 
   <footer>
-    Times are Honolulu time (HST). Live data from AeroDataBox.<br>
+    Times are Honolulu time (HST). Schedules &amp; gates: AeroDataBox. Live positions: <span id="liveSrc">community ADS-B receivers</span> (free, non-commercial use).<br>
     <span id="usageFoot"></span>
   </footer>
 </div>
@@ -158,7 +158,7 @@
         <option value="30">Every 30 minutes</option>
       </select>
     </div>
-    <div class="hint">The app always refreshes when you open it, if the data is more than 4 minutes old. Each refresh uses 2 API units.</div>
+    <div class="hint">The app always refreshes when you open it, if the data is more than 4 minutes old. Each refresh uses 2 API units. Live plane positions update every minute while the app is open, for free (no units).</div>
   </div>
 
   <div class="field">
@@ -178,7 +178,7 @@
   <div class="field">
     <label class="toggle"><input type="checkbox" id="demoChk"> Demo mode (sample data, no API key needed)</label>
   </div>
-  <div class="small" style="text-align:center">App version 3</div>
+  <div class="small" style="text-align:center">App version 4</div>
 
   <div class="field">
     <div class="row">
@@ -194,7 +194,19 @@
 
 /* ---------- constants ---------- */
 const STORE_KEY = 'hnlTracker.v1';
-const VERSION = 3;
+const VERSION = 4;
+// Free community ADS-B networks (no key). Tried in order; the one that works is remembered.
+const ADSB = [
+  { name: 'adsb.lol',       url: (la, lo, r) => 'https://api.adsb.lol/v2/point/' + la + '/' + lo + '/' + r },
+  { name: 'airplanes.live', url: (la, lo, r) => 'https://api.airplanes.live/v2/point/' + la + '/' + lo + '/' + r },
+  { name: 'adsb.fi',        url: (la, lo, r) => 'https://opendata.adsb.fi/api/v2/lat/' + la + '/lon/' + lo + '/dist/' + r }
+];
+const HI_AIRPORTS = [
+  { iata: 'HNL', lat: 21.3187, lon: -157.9224 }, { iata: 'OGG', lat: 20.8986, lon: -156.4305 },
+  { iata: 'KOA', lat: 19.7388, lon: -156.0456 }, { iata: 'LIH', lat: 21.9760, lon: -159.3390 },
+  { iata: 'ITO', lat: 19.7214, lon: -155.0485 }, { iata: 'MKK', lat: 21.1529, lon: -157.0963 },
+  { iata: 'LNY', lat: 20.7856, lon: -156.9514 }, { iata: 'JHM', lat: 20.9629, lon: -156.6730 }
+];
 const TZ = 'Pacific/Honolulu';
 const HOST = 'aerodatabox.p.rapidapi.com';
 const BASE = 'https://' + HOST;
@@ -210,7 +222,8 @@ const GONE = new Set(['Departed', 'EnRoute', 'Approaching', 'Arrived', 'Diverted
 function defaults() {
   return { version: VERSION, tails: [], apiKey: '', autoMins: 0, demo: false, flightFor: {},
            cache: { fids: null, reg: {}, num: {} }, track: {}, usage: { month: '', units: 0 },
-           diag: { calls: [], fids: null, tails: {} },
+           diag: { calls: [], fids: null, tails: {}, live: null },
+           live: null, lastLive: {}, groundSeen: {}, liveProvider: '',
            lastUpdated: 0, error: null, quota: null };
 }
 let S = defaults();
@@ -219,7 +232,7 @@ try {
   if (saved && typeof saved === 'object') S = Object.assign(defaults(), saved);
   S.cache = Object.assign({ fids: null, reg: {}, num: {} }, S.cache || {});
   S.diag = Object.assign({ calls: [], fids: null, tails: {} }, S.diag || {});
-  S.flightFor = S.flightFor || {};
+  S.flightFor = S.flightFor || {}; S.lastLive = S.lastLive || {}; S.groundSeen = S.groundSeen || {};
   if (saved && saved.version !== VERSION) {   // new app version: drop old cached lookups so tails are re-checked
     S.cache = { fids: null, reg: {}, num: {} }; S.version = VERSION;
   }
@@ -320,7 +333,7 @@ function normLeg(f, side) {
   }
   const loc = f.location || null;
   return {
-    number: f.number || '', status: f.status || 'Unknown',
+    number: f.number || '', callSign: f.callSign || '', status: f.status || 'Unknown',
     reg: normTail(f.aircraft && f.aircraft.reg), model: (f.aircraft && f.aircraft.model) || '',
     codeshare: f.codeshareStatus === 'IsCodeshared',
     from, to,
@@ -399,13 +412,156 @@ function numberConflict(tail) {
 }
 function allLegsFor(tail) {
   if (S.demo) return (demoLegs || []).slice();
-  const legs = [], seen = new Set();
-  const add = (l) => { const k = legKey(l); if (!seen.has(k)) { seen.add(k); legs.push(l); } };
+  const map = new Map();
+  const add = (l) => { const k = legKey(l); if (!map.has(k)) map.set(k, l); };
   if (S.cache.fids) for (const l of S.cache.fids.legs) if (l.reg === tail) add(l);
   const r = S.cache.reg[tail];
   if (r) for (const l of r.legs) add(l);
   for (const l of numberLegsFor(tail)) add(l);
-  return legs;
+  const base = [...map.values()];
+  for (const l of liveLegs(tail, base)) map.set(legKey(l), l);     // live position wins over the schedule
+  return [...map.values()];
+}
+
+/* ---------- live positions (free ADS-B networks) ---------- */
+function bearing(lat1, lon1, lat2, lon2) {
+  const r = Math.PI / 180, dl = (lon2 - lon1) * r;
+  const y = Math.sin(dl) * Math.cos(lat2 * r);
+  const x = Math.cos(lat1 * r) * Math.sin(lat2 * r) - Math.sin(lat1 * r) * Math.cos(lat2 * r) * Math.cos(dl);
+  return (Math.atan2(y, x) / r + 360) % 360;
+}
+function nearestAirport(lat, lon) {
+  let best = null;
+  for (const a of HI_AIRPORTS) { const d = nm(lat, lon, a.lat, a.lon); if (!best || d < best.d) best = { iata: a.iata, d }; }
+  return best;
+}
+function isGround(a) { return a.alt === 'ground' || (a.gs != null && a.gs < 40 && (a.alt == null || a.alt < 800)); }
+function headingTo(a, apt, d) {
+  if (d < 12 && typeof a.alt === 'number' && a.alt < 5000) return true;
+  if (a.track == null) return false;
+  const diff = Math.abs(((a.track - bearing(a.lat, a.lon, apt.lat, apt.lon)) + 540) % 360 - 180);
+  return diff <= 35;
+}
+function liveEta(a, d, posAt) {
+  const gs = a.gs && a.gs > 100 ? a.gs : 250;
+  const hrs = d > 40 ? (d - 40) / gs + 40 / Math.min(gs, 230) : d / Math.max(Math.min(gs, 230), 130);
+  const land = posAt + hrs * HOUR + 2 * MIN;
+  return { land, gate: land + 5 * MIN };
+}
+const digitsOf = (f) => { const m = String(f || '').match(/(\d+)$/); return m ? String(parseInt(m[1], 10)) : ''; };
+function prettyFlight(cs) { const f = normFlight(cs); return f ? f.replace(/^([A-Z0-9]{2})(\d+)$/, '$1 $2') : String(cs || ''); }
+function legsForCallsign(cs, pool) {
+  const c = String(cs || '').toUpperCase().replace(/\s+/g, '');
+  if (!c) return [];
+  const fn = normFlight(c), dg = digitsOf(fn);
+  let hits = pool.filter(l => l.callSign && l.callSign.toUpperCase().replace(/\s+/g, '') === c);
+  if (!hits.length && fn) hits = pool.filter(l => normFlight(l.number) === fn);
+  if (!hits.length && dg && /^(HA|AS)/.test(fn)) hits = pool.filter(l => /^(HA|AS)\d/.test(normFlight(l.number)) && digitsOf(normFlight(l.number)) === dg);
+  return hits;
+}
+function liveFor(tail) {
+  const now = Date.now();
+  const cur = S.live && S.live.ac && S.live.ac[tail];
+  if (cur && now - cur.at < 10 * MIN) return cur;
+  const last = S.lastLive && S.lastLive[tail];
+  if (last && now - last.at < 6 * HOUR && isGround(last)) {      // parked at HNL with the transponder off
+    const ap = nearestAirport(last.lat, last.lon);
+    if (ap.iata === 'HNL' && ap.d <= 4) return Object.assign({}, last, { stale: true });
+  }
+  return null;
+}
+function blankMv(iata) { return { iata: iata || '', name: '', sched: null, revised: null, predicted: null, runway: null, est: null, gate: '', terminal: '' }; }
+function liveLegs(tail, base) {
+  const a = liveFor(tail);
+  if (!a) return [];
+  const now = Date.now();
+  const pool = (S.cache.fids ? S.cache.fids.legs : []).concat(base);
+  const hits = legsForCallsign(a.cs, pool);
+  const arrHit = hits.find(l => l.to.iata === 'HNL' && l.status !== 'Canceled');
+  const depHit = hits.find(l => l.from.iata === 'HNL' && l.status !== 'Canceled');
+  const ground = isGround(a);
+  const ap = nearestAirport(a.lat, a.lon);
+  const atAp = ap && ap.d <= 4 ? ap.iata : '';
+  const dHnl = nm(a.lat, a.lon, HNL.lat, HNL.lon);
+  const posAt = a.at - (a.seenPos || 0) * 1000;
+  const loc = { lat: a.lat, lon: a.lon, ft: ground ? null : a.alt, kt: ground ? null : a.gs, at: posAt, live: true, ground, ap: atAp, cs: a.cs, stale: !!a.stale };
+  const clone = (l, patch) => Object.assign({}, l, { reg: tail, codeshare: false, viaLive: true, loc }, patch || {});
+  const out = [];
+  if (!ground) {
+    if (arrHit) {
+      const eta = liveEta(a, dHnl, posAt);
+      const notYet = ['Expected', 'Unknown', 'Delayed', 'Boarding', 'GateClosed', 'CheckIn', 'Arrived'].includes(arrHit.status);
+      out.push(clone(arrHit, { status: notYet ? 'EnRoute' : arrHit.status,
+        to: Object.assign({}, arrHit.to, { est: eta.gate, land: eta.land, src: 'adsb' }) }));
+    } else if (depHit) {
+      out.push(clone(depHit, { status: 'EnRoute' }));                     // just left HNL
+    } else if (dHnl <= 260 && headingTo(a, HNL, dHnl)) {
+      const eta = liveEta(a, dHnl, posAt);
+      out.push({ number: prettyFlight(a.cs), callSign: a.cs, status: 'EnRoute', reg: tail, model: '', codeshare: false,
+        synthetic: true, viaLive: true, loc, from: blankMv(''),
+        to: Object.assign(blankMv('HNL'), { name: 'Honolulu', est: eta.gate, land: eta.land, src: 'adsb' }) });
+    }
+  } else if (atAp === 'HNL') {
+    const since = (S.groundSeen[tail] && S.groundSeen[tail].at) || posAt;
+    if (arrHit) {
+      const t = arrHit.to.revised ?? arrHit.to.runway ?? since;
+      out.push(clone(arrHit, { status: 'Arrived',
+        to: Object.assign({}, arrHit.to, { revised: t, est: t, src: arrHit.to.revised != null ? 'live' : 'adsb-ground' }) }));
+    } else if (analyse(tail, base, now).mode !== 'ground') {
+      out.push({ number: '', callSign: '', status: 'Arrived', reg: tail, model: '', codeshare: false, synthetic: true, viaLive: true, loc,
+        from: blankMv(''), to: Object.assign(blankMv('HNL'), { name: 'Honolulu', revised: since, est: since, src: 'adsb-ground' }) });
+    }
+    if (depHit) out.push(clone(depHit, {}));                             // crew already set the next flight's callsign
+  } else if (arrHit) {
+    out.push(clone(arrHit, {}));                                         // sitting at another airport before the HNL flight
+  }
+  return out;
+}
+async function fetchLive() {
+  if (S.demo || !S.tails.length) return false;
+  const order = ADSB.slice().sort((x, y) => (y.name === S.liveProvider) - (x.name === S.liveProvider));
+  const failed = [];
+  for (const p of order) {
+    const ctl = new AbortController(), timer = setTimeout(() => ctl.abort(), 8000);
+    try {
+      const res = await fetch(p.url(HNL.lat, HNL.lon, 250), { signal: ctl.signal });
+      clearTimeout(timer);
+      if (!res.ok) { failed.push(p.name + ' ' + res.status); continue; }
+      const d = await res.json();
+      const list = (d && (d.ac || d.aircraft)) || [];
+      const now = Date.now(), want = new Set(S.tails), mine = {};
+      for (const x of list) {
+        const reg = normTail(x.r || x.reg || '');
+        if (!want.has(reg) || typeof x.lat !== 'number' || typeof x.lon !== 'number') continue;
+        mine[reg] = {
+          cs: String(x.flight || '').trim(), lat: x.lat, lon: x.lon,
+          alt: x.alt_baro === 'ground' ? 'ground' : (typeof x.alt_baro === 'number' ? x.alt_baro : (typeof x.alt_geom === 'number' ? x.alt_geom : null)),
+          gs: typeof x.gs === 'number' ? x.gs : null,
+          track: typeof x.track === 'number' ? x.track : (typeof x.true_heading === 'number' ? x.true_heading : null),
+          seenPos: typeof x.seen_pos === 'number' ? x.seen_pos : (typeof x.seen === 'number' ? x.seen : 0), at: now
+        };
+      }
+      S.live = { at: now, provider: p.name, ac: mine, count: list.length };
+      S.liveProvider = p.name;
+      for (const [tail, a] of Object.entries(mine)) {
+        S.lastLive[tail] = a;
+        const ap = nearestAirport(a.lat, a.lon);
+        if (isGround(a) && ap.iata === 'HNL' && ap.d <= 4) { if (!S.groundSeen[tail]) S.groundSeen[tail] = { at: now - (a.seenPos || 0) * 1000 }; }
+        else delete S.groundSeen[tail];
+      }
+      S.diag.live = { provider: p.name, at: tm(now), aircraftWithin250nm: list.length, failedFirst: failed,
+        yourTails: Object.fromEntries(Object.entries(mine).map(([k, v]) => [k, (v.cs || 'no callsign') + ' · ' +
+          (isGround(v) ? 'ground' : v.alt + ' ft ' + v.gs + ' kt') + ' · ' + Math.round(nm(v.lat, v.lon, HNL.lat, HNL.lon)) + ' nm']) ) };
+      save();
+      return true;
+    } catch (e) {
+      clearTimeout(timer);
+      failed.push(p.name + ' ' + (e && e.name === 'AbortError' ? 'timeout' : 'blocked'));
+    }
+  }
+  S.diag.live = { at: tm(Date.now()), failed };
+  save();
+  return false;
 }
 
 /* ---------- network ---------- */
@@ -457,11 +613,12 @@ async function refresh(opts) {
   if (busy) return;
   if (S.demo) { demoLegs = makeDemo(); S.lastUpdated = Date.now(); S.error = null; render(); return; }
   if (!S.tails.length) { render(); return; }
-  if (!S.apiKey) { render(); return; }
   busy = true; setSpin(true);
   let calls = 0;
   const pause = async () => { if (calls) await sleep(1100); };   // free plan: 1 request per second
   try {
+    await fetchLive();                                             // free, no units
+    if (!S.apiKey) { S.lastUpdated = Date.now(); return; }
     const now = Date.now();
     if (opts.force || !S.cache.fids || now - S.cache.fids.at > FIDS_TTL) {
       const q = '/flights/airports/iata/HNL?offsetMinutes=-120&durationMinutes=720&direction=Both&withLeg=true' +
@@ -539,7 +696,7 @@ function diagText() {
     app: 'HNL Arrivals v' + VERSION, at: tm(Date.now()) + ' HST', tails: S.tails, flightNumbers: S.flightFor,
     keySaved: !!S.apiKey, keyLength: (S.apiKey || '').length, unitsThisMonth: S.usage.units,
     lastUpdated: S.lastUpdated ? tm(S.lastUpdated) : null, lastError: S.error ? S.error.msg : null,
-    hnlList: S.diag.fids, perTail: S.diag.tails,
+    live: S.diag.live, hnlList: S.diag.fids, perTail: S.diag.tails,
     calls: S.diag.calls.map(c => tm(c.at) + '  ' + c.what + '  -> ' + c.status)
   }, null, 1);
 }
@@ -609,6 +766,14 @@ function cardHTML(tail, a, now) {
            '<div class="note">It often doesn\'t know which plane is on a flight until it starts tracking that flight. ' +
            'FlightAware gets the airline\'s tail assignments sooner. If you know the inbound flight number, enter it below to get the ETA and gate now.</div>';
     }
+    const lv = liveFor(tail);
+    if (lv) {
+      const lap = nearestAirport(lv.lat, lv.lon), ld = nm(lv.lat, lv.lon, HNL.lat, HNL.lon);
+      h += '<div class="note">📍 <b>Live:</b> ' + (lv.cs ? esc(lv.cs) + ' · ' : '') +
+        (isGround(lv) ? 'on the ground' + (lap.d <= 4 ? ' at <b>' + esc(lap.iata) + '</b>' : '')
+                      : 'in the air, ' + Math.round(ld) + ' nm from HNL' + (headingTo(lv, HNL, ld) ? ', heading toward HNL' : ', not heading to HNL')) +
+        ' · ' + tm(lv.at) + '</div>';
+    }
     if (a.lastOut) h += '<div class="note">Last seen leaving HNL: <b>' + esc(a.lastOut.number) + ' → ' +
       esc(a.lastOut.to.iata) + '</b> at ' + tm(a.lastOut.from.est) + '</div>';
     if (live) {
@@ -623,7 +788,9 @@ function cardHTML(tail, a, now) {
   }
 
   const l = a.a, to = l.to, from = l.from;
-  h += '<div class="route"><b>' + esc(l.number || 'Flight ?') + '</b> from <b>' + esc(from.iata || from.name || '?') + '</b>' +
+  if (l.synthetic && a.mode === 'ground') h += '<div class="route">On the ground at <b>HNL</b> (from live position data)</div>';
+  else if (l.synthetic) h += '<div class="route"><b>' + esc(l.number || l.callSign || 'Flight ?') + '</b> · heading toward HNL</div>';
+  else h += '<div class="route"><b>' + esc(l.number || 'Flight ?') + '</b> from <b>' + esc(from.iata || from.name || '?') + '</b>' +
        (from.name && from.iata ? ' · ' + esc(from.name) : '') + '</div>';
   if (l.byNumber) h += '<div class="note">Found by the flight number you entered, because the data hasn\'t linked this tail yet. ' +
        'The next departure may not show until it does. <button class="linkbtn" data-unflight="' + esc(tail) + '">Stop using flight #</button></div>';
@@ -631,8 +798,11 @@ function cardHTML(tail, a, now) {
   if (a.mode === 'ground') {
     const at = to.revised ?? to.runway ?? to.est;
     h += '<div class="chips"><span class="chip ok">At HNL</span>' + delayChip(to.sched, at) + '</div>';
-    h += '<div class="grid"><div><div class="lbl">Arrived</div><div class="big">' + bigTm(at) + '</div>' +
-         '<div class="small">on the ground ' + dur(now - at) + '</div></div>' + gateBlock(to, 'Gate') + '</div>';
+    const approx = to.src === 'adsb-ground', stale = l.loc && l.loc.stale;
+    h += '<div class="grid"><div><div class="lbl">' + (approx ? 'On ground since' : 'Arrived') + '</div><div class="big">' + bigTm(at) + '</div>' +
+         '<div class="small">' + (approx ? 'when the app first saw it on the ground' : 'on the ground ' + dur(now - at)) + '</div></div>' +
+         gateBlock(to, 'Gate') + '</div>';
+    if (stale) h += '<div class="note">Transponder off since ' + tm(l.loc.at) + ' (normal once parked). Last seen on the ground at HNL.</div>';
     h += nextBlock(a.next, now);
     if (a.later && a.later !== l) h += '<div class="small" style="margin-top:8px">Next HNL arrival: <b>' + esc(a.later.number) +
       '</b> from ' + esc(a.later.from.iata) + ' at <b>' + tm(a.later.to.est) + '</b></div>';
@@ -640,7 +810,7 @@ function cardHTML(tail, a, now) {
   }
 
   // inbound
-  const notDeparted = ['Expected', 'CheckIn', 'Boarding', 'GateClosed', 'Unknown', 'Delayed'].includes(l.status) && !l.loc;
+  const notDeparted = ['Expected', 'CheckIn', 'Boarding', 'GateClosed', 'Unknown', 'Delayed'].includes(l.status) && (!l.loc || l.loc.ground);
   h += '<div class="chips">' + statusChip(l) + (l.status === 'Canceled' ? '' :
        to.src === 'scheduled' ? '<span class="chip">No live ETA</span>' : delayChip(to.sched, to.est)) + '</div>';
   const until = to.est != null ? to.est - now : null;
@@ -655,6 +825,8 @@ function cardHTML(tail, a, now) {
   if (to.src === 'scheduled') h += '<div class="note">This is the <b>scheduled</b> time. AeroDataBox has no live estimate for this flight yet, so check FlightAware if it matters.</div>';
   else if (to.src === 'depdelay') h += '<div class="note">Estimated: it left about <b>' + Math.round(to.depDelay / MIN) + ' min late</b> and there\'s no live ETA yet, so treat this as approximate.</div>';
   else if (to.src === 'predicted') h += '<div class="note">AeroDataBox prediction (no live ETA yet).</div>';
+  else if (to.src === 'adsb') h += '<div class="note">Live estimate from the plane\'s position: lands ≈ <b>' + tm(to.land) + '</b>, at the gate ≈ ' + tm(to.est) +
+    '. Approximate.' + (l.synthetic ? ' This flight isn\'t in AeroDataBox\'s HNL list, so there\'s no gate or schedule.' : '') + '</div>';
 
   // ETA movement since first seen
   const tr = S.track[tail];
@@ -668,12 +840,14 @@ function cardHTML(tail, a, now) {
     (from.sched != null && from.est - from.sched > 5 * MIN ? ' (sched ' + tm(from.sched) + ')' : '') + '</div>';
   else if (from.est != null) h += '<div class="pos">Left ' + esc(from.iata || '?') + ' at ' + tm(from.revised ?? from.est) + ' HST</div>';
 
-  if (l.loc) {
+  if (l.loc && l.loc.ground) {
+    h += '<div class="pos">📍 On the ground' + (l.loc.ap ? ' at <b>' + esc(l.loc.ap) + '</b>' : '') + ' · live, ' + tm(l.loc.at) + '</div>';
+  } else if (l.loc) {
     const d = Math.round(nm(l.loc.lat, l.loc.lon, HNL.lat, HNL.lon));
     const parts = [d + ' nm from HNL'];
     if (l.loc.ft != null) parts.push(Math.round(l.loc.ft / 100) * 100 >= 18000 ? 'FL' + Math.round(l.loc.ft / 100) : Math.round(l.loc.ft).toLocaleString() + ' ft');
     if (l.loc.kt != null) parts.push(Math.round(l.loc.kt) + ' kt');
-    h += '<div class="pos">📍 ' + parts.join(' · ') + (l.loc.at ? ' · as of ' + tm(l.loc.at) : '') + '</div>';
+    h += '<div class="pos">📍 ' + parts.join(' · ') + (l.loc.at ? (l.loc.live ? ' · live, ' : ' · as of ') + tm(l.loc.at) : '') + '</div>';
   }
   h += nextBlock(a.next, now);
   return h + links(tail) + '</div>';
@@ -682,7 +856,10 @@ function cardHTML(tail, a, now) {
 function render() {
   const now = Date.now();
   // header
-  $('updated').textContent = S.lastUpdated ? 'Updated ' + tm(S.lastUpdated) + ' (' + (now - S.lastUpdated < MIN ? 'just now' : dur(now - S.lastUpdated) + ' ago') + ')' : 'Not updated yet';
+  const ago = (t) => now - t < MIN ? 'just now' : dur(now - t) + ' ago';
+  $('updated').textContent = (S.lastUpdated ? 'Updated ' + tm(S.lastUpdated) + ' (' + ago(S.lastUpdated) + ')' : 'Not updated yet') +
+    (S.live && !S.demo ? ' · positions ' + ago(S.live.at) : '');
+  if (S.live && S.live.provider) $('liveSrc').textContent = S.live.provider;
 
   // banners
   let b = '';
@@ -755,6 +932,7 @@ document.addEventListener('click', (e) => {
   if (rm) {
     const t = rm.getAttribute('data-rm'); S.tails = S.tails.filter(x => x !== t);
     delete S.track[t]; delete S.cache.reg[t]; delete S.cache.num[t]; delete S.flightFor[t]; delete S.diag.tails[t];
+    delete S.lastLive[t]; delete S.groundSeen[t];
     save(); render(); return;
   }
   const uf = e.target.closest('[data-unflight]');
@@ -814,7 +992,7 @@ $('demoChk').addEventListener('change', () => {
 $('clearBtn').addEventListener('click', () => {
   const btn = $('clearBtn');
   if (!btn.dataset.armed) { btn.dataset.armed = '1'; btn.textContent = 'Tap again to clear'; return; }
-  S.tails = []; S.track = {}; S.cache.reg = {}; S.cache.num = {}; S.flightFor = {}; S.diag.tails = {};
+  S.tails = []; S.track = {}; S.cache.reg = {}; S.cache.num = {}; S.flightFor = {}; S.diag.tails = {}; S.lastLive = {}; S.groundSeen = {};
   save(); closeSheet(); render();
 });
 
@@ -827,6 +1005,12 @@ document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible') { render(); refresh(); }
 });
 setInterval(() => { if (document.visibilityState === 'visible' && !busy) render(); }, 30e3);
+let liveBusy = false;
+setInterval(async () => {                 // free live positions every minute while the app is open
+  if (document.visibilityState !== 'visible' || busy || liveBusy || S.demo || !S.tails.length) return;
+  liveBusy = true;
+  try { await fetchLive(); } catch (e) {} finally { liveBusy = false; render(); }
+}, 60e3);
 
 /* ---------- start ---------- */
 setupAuto();
